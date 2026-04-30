@@ -49,6 +49,8 @@ def setup_driver():
     options.add_argument("--disable-blink-features=AutomationControlled")
     options.add_argument("--disable-extensions")
     options.add_argument("--disable-infobars")
+    options.add_argument("--single-process")
+    options.add_argument("--disable-setuid-sandbox")
     options.add_experimental_option("excludeSwitches", ["enable-automation"])
     options.add_experimental_option("useAutomationExtension", False)
     options.add_argument(
@@ -56,7 +58,40 @@ def setup_driver():
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/120.0.0.0 Safari/537.36"
     )
-    driver = webdriver.Chrome(options=options)
+
+    # Find Chrome binary — Railway/Nix installs it in different locations
+    import shutil
+    chrome_paths = [
+        "/usr/bin/google-chrome",
+        "/usr/bin/google-chrome-stable",
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
+        "/run/current-system/sw/bin/chromium",
+        shutil.which("google-chrome") or "",
+        shutil.which("chromium") or "",
+        shutil.which("chromium-browser") or "",
+    ]
+    for path in chrome_paths:
+        if path and os.path.exists(path):
+            options.binary_location = path
+            print(f"[+] Using Chrome at: {path}")
+            break
+
+    # Find chromedriver
+    driver_paths = [
+        "/usr/bin/chromedriver",
+        "/run/current-system/sw/bin/chromedriver",
+        shutil.which("chromedriver") or "",
+    ]
+    service = None
+    for path in driver_paths:
+        if path and os.path.exists(path):
+            from selenium.webdriver.chrome.service import Service
+            service = Service(executable_path=path)
+            print(f"[+] Using chromedriver at: {path}")
+            break
+
+    driver = webdriver.Chrome(service=service, options=options) if service else webdriver.Chrome(options=options)
     driver.execute_script(
         "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
     )
