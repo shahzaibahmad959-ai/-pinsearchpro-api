@@ -59,37 +59,30 @@ def setup_driver():
         "Chrome/120.0.0.0 Safari/537.36"
     )
 
-    # Find Chrome binary — Railway/Nix installs it in different locations
+    # Chrome is installed via Dockerfile at this exact path
     import shutil
-    chrome_paths = [
-        "/usr/bin/google-chrome",
-        "/usr/bin/google-chrome-stable",
-        "/usr/bin/chromium",
-        "/usr/bin/chromium-browser",
-        "/run/current-system/sw/bin/chromium",
-        shutil.which("google-chrome") or "",
-        shutil.which("chromium") or "",
-        shutil.which("chromium-browser") or "",
-    ]
-    for path in chrome_paths:
-        if path and os.path.exists(path):
-            options.binary_location = path
-            print(f"[+] Using Chrome at: {path}")
-            break
+    from selenium.webdriver.chrome.service import Service
+
+    # Find Chrome binary
+    chrome_bin = os.environ.get("CHROME_BIN", "")
+    if not chrome_bin or not os.path.exists(chrome_bin):
+        for p in ["/usr/bin/google-chrome", "/usr/bin/google-chrome-stable",
+                  "/usr/bin/chromium", "/usr/bin/chromium-browser",
+                  shutil.which("google-chrome") or "",
+                  shutil.which("chromium") or ""]:
+            if p and os.path.exists(p):
+                chrome_bin = p
+                break
+    if chrome_bin:
+        options.binary_location = chrome_bin
+        print(f"[+] Chrome binary: {chrome_bin}")
+    else:
+        print("[!] Chrome binary not found — trying default")
 
     # Find chromedriver
-    driver_paths = [
-        "/usr/bin/chromedriver",
-        "/run/current-system/sw/bin/chromedriver",
-        shutil.which("chromedriver") or "",
-    ]
-    service = None
-    for path in driver_paths:
-        if path and os.path.exists(path):
-            from selenium.webdriver.chrome.service import Service
-            service = Service(executable_path=path)
-            print(f"[+] Using chromedriver at: {path}")
-            break
+    driver_bin = shutil.which("chromedriver") or "/usr/local/bin/chromedriver"
+    print(f"[+] Chromedriver: {driver_bin}")
+    service = Service(executable_path=driver_bin) if os.path.exists(driver_bin) else None
 
     driver = webdriver.Chrome(service=service, options=options) if service else webdriver.Chrome(options=options)
     driver.execute_script(
