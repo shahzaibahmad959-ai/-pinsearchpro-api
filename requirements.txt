@@ -2,6 +2,7 @@ selenium==4.18.1
 geckodriver-autoinstaller
 openpyxl
 flask
+gunicorn
 supabase
 python-dotenv
 celery
