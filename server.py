@@ -1,194 +1,44 @@
 """
-PinSearchPro — Flask API Server
-================================
-No login required — opens Pinterest explore page,
-dismisses any popups, then searches normally.
-
-Endpoints:
-  POST /search            — start a search job
-  GET  /status/<job_id>   — check job status + live results
-  GET  /download/<job_id> — download Excel file
-  GET  /health            — server health check
+PinSearchPro — No-Browser API Server
+======================================
+Uses Pinterest's internal API + HTTP requests.
+No Selenium, no Chrome, no Firefox needed.
+Fast, lightweight, works on any server.
 """
 
-import os, re, time, uuid, threading
+import os, re, time, uuid, threading, requests
 from datetime import datetime
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options as ChromeOptions
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException, WebDriverException
 
 app = Flask(__name__)
 CORS(app)
 
-jobs = {}  # in-memory job store
-
-SCROLL_PAUSE   = 2.5
-PAGE_LOAD_WAIT = 6
-AHREFS_WAIT    = 10
-OUTPUT_DIR     = "/tmp/pinsearch_results"
+jobs = {}
+OUTPUT_DIR = "/tmp/pinsearch_results"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
+# ── Pinterest session (set in Railway environment variables) ──
+# Get this from your browser:
+# 1. Open pinterest.com (logged in)
+# 2. Press F12 → Network tab → refresh page
+# 3. Click any request → Headers → Cookie
+# 4. Copy the full cookie string
+# Set it as PINTEREST_COOKIE env var in Railway
+PINTEREST_COOKIE = os.environ.get("PINTEREST_COOKIE", "")
 
-# ─────────────────────────────────────────────
-#  DRIVER SETUP
-# ─────────────────────────────────────────────
-def setup_driver():
-    options = ChromeOptions()
-    options.add_argument("--headless=new")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--disable-gpu")
-    options.add_argument("--window-size=1920,1080")
-    options.add_argument("--disable-blink-features=AutomationControlled")
-    options.add_argument("--disable-extensions")
-    options.add_argument("--disable-infobars")
-    options.add_argument("--single-process")
-    options.add_argument("--disable-setuid-sandbox")
-    options.add_experimental_option("excludeSwitches", ["enable-automation"])
-    options.add_experimental_option("useAutomationExtension", False)
-    options.add_argument(
-        "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
-    )
+# Pinterest API base URL
+PIN_API = "https://www.pinterest.com/resource"
 
-    # Chrome is installed via Dockerfile at this exact path
-    import shutil
-    from selenium.webdriver.chrome.service import Service
-
-    # Find Chrome binary
-    chrome_bin = os.environ.get("CHROME_BIN", "")
-    if not chrome_bin or not os.path.exists(chrome_bin):
-        for p in ["/usr/bin/google-chrome", "/usr/bin/google-chrome-stable",
-                  "/usr/bin/chromium", "/usr/bin/chromium-browser",
-                  shutil.which("google-chrome") or "",
-                  shutil.which("chromium") or ""]:
-            if p and os.path.exists(p):
-                chrome_bin = p
-                break
-    if chrome_bin:
-        options.binary_location = chrome_bin
-        print(f"[+] Chrome binary: {chrome_bin}")
-    else:
-        print("[!] Chrome binary not found — trying default")
-
-    # Find chromedriver
-    driver_bin = shutil.which("chromedriver") or "/usr/local/bin/chromedriver"
-    print(f"[+] Chromedriver: {driver_bin}")
-    service = Service(executable_path=driver_bin) if os.path.exists(driver_bin) else None
-
-    driver = webdriver.Chrome(service=service, options=options) if service else webdriver.Chrome(options=options)
-    driver.execute_script(
-        "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
-    )
-    driver.set_page_load_timeout(30)
-    driver.set_script_timeout(30)
-    return driver
-
-
-# ─────────────────────────────────────────────
-#  OPEN PINTEREST WITHOUT LOGIN
-# ─────────────────────────────────────────────
-def open_pinterest_no_login(driver, job_id):
-    """
-    Strategy:
-    1. Open pinterest.com/ideas (explore page — works without login)
-    2. If a login popup appears, close it
-    3. If redirected to login page, try the explore URL directly
-    """
-    update_progress(job_id, "Opening Pinterest explore page...")
-
-    # Try explore/ideas page first — usually no login required
-    explore_urls = [
-        "https://www.pinterest.com/ideas/",
-        "https://www.pinterest.com/explore/",
-        "https://www.pinterest.com/",
-    ]
-
-    for url in explore_urls:
-        try:
-            driver.get(url)
-            time.sleep(PAGE_LOAD_WAIT)
-            dismiss_all_popups(driver)
-
-            # Check if we're on a login wall
-            current = driver.current_url.lower()
-            page_text = driver.page_source.lower()
-
-            login_blocked = (
-                "login" in current or
-                "accounts" in current or
-                ("create account" in page_text and "explore" not in current)
-            )
-
-            if not login_blocked:
-                update_progress(job_id, f"Pinterest loaded via {url} ✓")
-                return True
-
-            update_progress(job_id, f"Login wall at {url} — trying next...")
-
-        except Exception as e:
-            update_progress(job_id, f"Error loading {url}: {e}")
-            continue
-
-    # Last resort — go directly to search URL (sometimes bypasses login)
-    update_progress(job_id, "Using direct search URL strategy...")
-    return True   # continue anyway — search URL often works
-
-
-# ─────────────────────────────────────────────
-#  POPUP DISMISSAL
-# ─────────────────────────────────────────────
-def dismiss_all_popups(driver):
-    """Try every known Pinterest popup close button."""
-    selectors = [
-        # Login/signup modal close buttons
-        "button[data-test-id='closeup-close-button']",
-        "button[aria-label='Close']",
-        "button[aria-label='close']",
-        "div[data-test-id='interstitial-close-button']",
-        "[data-test-id='login-page'] button[aria-label='Close']",
-        # Generic close icons
-        "button.XiG",
-        "[class*='closeButton']",
-        "[class*='CloseButton']",
-        # 'Not now' / 'Continue as guest' type buttons
-        "button[data-test-id='simple-dialog-close-button']",
-    ]
-    for sel in selectors:
-        try:
-            btn = driver.find_element(By.CSS_SELECTOR, sel)
-            btn.click()
-            time.sleep(0.6)
-            return True
-        except Exception:
-            continue
-
-    # Try clicking outside the modal (to dismiss it)
-    try:
-        overlay = driver.find_element(By.CSS_SELECTOR, "[class*='overlay'], [class*='Overlay']")
-        overlay.click()
-        time.sleep(0.6)
-        return True
-    except Exception:
-        pass
-
-    # Try pressing Escape
-    try:
-        from selenium.webdriver.common.keys import Keys
-        driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
-        time.sleep(0.5)
-    except Exception:
-        pass
-
-    return False
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/javascript, */*, q=0.01",
+    "Accept-Language": "en-US,en;q=0.9",
+    "X-Requested-With": "XMLHttpRequest",
+    "Referer": "https://www.pinterest.com/",
+}
 
 
 # ─────────────────────────────────────────────
@@ -200,16 +50,14 @@ def update_progress(job_id, msg):
         print(f"[{job_id[:8]}] {msg}")
 
 def parse_number(text):
-    if not text:
-        return None
-    t = text.strip().upper().replace(",", "").replace("+", "").replace(" ", "")
+    if not text: return None
+    t = str(text).strip().upper().replace(",","").replace("+","").replace(" ","")
     try:
-        if "B" in t: return int(float(t.replace("B", "")) * 1_000_000_000)
-        if "M" in t: return int(float(t.replace("M", "")) * 1_000_000)
-        if "K" in t: return int(float(t.replace("K", "")) * 1_000)
-        return int(float(re.sub(r"[^\d.]", "", t)))
-    except Exception:
-        return None
+        if "B" in t: return int(float(t.replace("B","")) * 1_000_000_000)
+        if "M" in t: return int(float(t.replace("M","")) * 1_000_000)
+        if "K" in t: return int(float(t.replace("K","")) * 1_000)
+        return int(float(re.sub(r"[^\d.]","",t)))
+    except: return None
 
 def fmt(n):
     if n is None: return "N/A"
@@ -217,276 +65,139 @@ def fmt(n):
     if n >= 1_000: return f"{n/1_000:.1f}K"
     return str(n)
 
+def get_session():
+    """Create a requests session with Pinterest headers."""
+    s = requests.Session()
+    s.headers.update(HEADERS)
+    if PINTEREST_COOKIE:
+        s.headers["Cookie"] = PINTEREST_COOKIE
+        # Extract CSRF token from cookie
+        m = re.search(r"csrftoken=([^;]+)", PINTEREST_COOKIE)
+        if m:
+            s.headers["X-CSRFToken"] = m.group(1)
+    return s
+
 
 # ─────────────────────────────────────────────
-#  GET WEBSITE FROM PROFILE
+#  PINTEREST API CALLS
 # ─────────────────────────────────────────────
-def get_website_from_profile(driver, profile_url):
+def search_pins(session, keyword, max_pins=20):
+    """Search Pinterest for pins using their internal API."""
+    pins = []
+    bookmark = None
+    page_size = 25
+
+    update_progress_global = lambda msg: print(f"[search] {msg}")
+
+    while len(pins) < max_pins:
+        params = {
+            "source_url": f"/search/pins/?q={keyword}&rs=typed",
+            "data": '{"options":{"query":"' + keyword + '","scope":"pins","page_size":' + str(page_size) +
+                    (',"bookmarks":["' + bookmark + '"]' if bookmark else '') +
+                    '},"context":{}}',
+            "_": int(time.time() * 1000)
+        }
+
+        try:
+            resp = session.get(f"{PIN_API}/BaseSearchResource/get/", params=params, timeout=15)
+            if resp.status_code != 200:
+                break
+            data = resp.json()
+            resource_response = data.get("resource_response", {})
+            pin_data = resource_response.get("data", {}).get("results", [])
+
+            if not pin_data:
+                break
+
+            for pin in pin_data:
+                if len(pins) >= max_pins:
+                    break
+                pin_id   = pin.get("id")
+                pinner   = pin.get("pinner", {})
+                if pin_id and pinner:
+                    pins.append({
+                        "pin_id":       pin_id,
+                        "profile_id":   pinner.get("id"),
+                        "profile_name": pinner.get("full_name") or pinner.get("username",""),
+                        "username":     pinner.get("username",""),
+                        "monthly_views": pinner.get("monthly_views", 0),
+                        "website_url":  pinner.get("website_url","") or pinner.get("domain_url",""),
+                    })
+
+            # Get next page bookmark
+            bookmark = resource_response.get("bookmark")
+            if not bookmark:
+                break
+
+            time.sleep(0.5)  # be polite
+
+        except Exception as e:
+            print(f"Search error: {e}")
+            break
+
+    return pins[:max_pins]
+
+
+def get_profile_details(session, username):
+    """Get full profile details including monthly views and website."""
     try:
-        driver.get(profile_url)
-        time.sleep(PAGE_LOAD_WAIT)
-        dismiss_all_popups(driver)
-
-        for sel in [
-            "a[data-test-id='profile-website']",
-            "a[data-test-id='user-website-url']",
-            "[data-test-id='profile-website-link'] a",
-            "[class*='websiteUrl'] a",
-            "[class*='website'] a",
-        ]:
-            try:
-                el = driver.find_element(By.CSS_SELECTOR, sel)
-                href = el.get_attribute("href")
-                if href and "pinterest.com" not in href and href.startswith("http"):
-                    return href.strip()
-            except Exception:
-                continue
-
-        # Fallback: scan all external links on profile page
-        skip_domains = ["pinterest.com","facebook.com","instagram.com",
-                        "twitter.com","tiktok.com","youtube.com","google.com"]
-        for link in driver.find_elements(By.CSS_SELECTOR, "a[href]"):
-            href = link.get_attribute("href") or ""
-            if (href.startswith("http") and
-                    not any(d in href for d in skip_domains) and
-                    re.match(r"https?://[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}", href)):
-                return href.strip()
-    except Exception:
-        pass
-    return None
+        params = {
+            "source_url": f"/{username}/",
+            "data": f'{{"options":{{"username":"{username}"}},"context":{{}}}}',
+            "_": int(time.time() * 1000)
+        }
+        resp = session.get(f"{PIN_API}/UserResource/get/", params=params, timeout=15)
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        user = data.get("resource_response", {}).get("data", {})
+        return {
+            "username":     user.get("username",""),
+            "full_name":    user.get("full_name",""),
+            "monthly_views": user.get("monthly_views", 0),
+            "website_url":  user.get("website_url","") or user.get("domain_url",""),
+            "profile_url":  f"https://www.pinterest.com/{user.get('username','')}/",
+        }
+    except Exception as e:
+        print(f"Profile error for {username}: {e}")
+        return None
 
 
-# ─────────────────────────────────────────────
-#  GET WEBSITE TRAFFIC VIA AHREFS
-# ─────────────────────────────────────────────
-def get_website_traffic(driver, website_url):
+def get_website_traffic_api(website_url):
+    """
+    Check website traffic using SimilarWeb's free public data.
+    Falls back to a simple check if unavailable.
+    """
+    if not website_url:
+        return None
     try:
-        domain = re.sub(r"https?://(www\.)?", "", website_url).split("/")[0].strip()
+        domain = re.sub(r"https?://(www\.)?","", website_url).split("/")[0].strip()
         if not domain:
             return None
 
-        driver.get(f"https://ahrefs.com/traffic-checker/?target={domain}&mode=subdomains")
-        time.sleep(AHREFS_WAIT)
-
-        for sel in [
-            "[data-tf='organic-traffic']",
-            ".traffic-value",
-            "[class*='organicTraffic']",
-            "[class*='trafficValue']",
-            "p[class*='value']",
-            "span[class*='value']",
-        ]:
-            try:
-                els = driver.find_elements(By.CSS_SELECTOR, sel)
-                for el in els:
-                    val = parse_number(el.text.strip())
-                    if val and val > 0:
-                        return val
-            except Exception:
-                continue
-
-        # Fallback: scan full page text
-        try:
-            body = driver.find_element(By.TAG_NAME, "body").text
-            if "cloudflare" in body.lower() or "captcha" in body.lower():
-                return None
-            for pattern in [
-                r"Organic\s+traffic[^\d]*(\d[\d,\.]*[KMB]?)",
-                r"(\d[\d,\.]*[KMB]?)\s*organic\s*(?:visitors|traffic|visits)",
-                r"Traffic[^\d]*(\d[\d,\.]*[KMB]?)",
-                r"(\d[\d,\.]*[KMB]?)\s*visitors",
-            ]:
-                m = re.search(pattern, body, re.IGNORECASE)
-                if m:
-                    val = parse_number(m.group(1))
-                    if val is not None:
-                        return val
-        except Exception:
-            pass
-    except Exception:
-        pass
-    return None
-
-
-# ─────────────────────────────────────────────
-#  SCRAPE PINS
-# ─────────────────────────────────────────────
-def scrape_pins(driver, keyword, min_views_m, min_traffic, max_pins, job_id):
-    results = []
-    seen_profiles = set()
-    min_views_raw = int(min_views_m * 1_000_000)
-
-    try:
-        # Go directly to Pinterest search — works without login
-        search_url = (
-            f"https://www.pinterest.com/search/pins/"
-            f"?q={keyword.replace(' ', '%20')}&rs=typed"
+        # Try SimilarWeb public API
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "application/json",
+        }
+        resp = requests.get(
+            f"https://data.similarweb.com/api/v1/data?domain={domain}",
+            headers=headers, timeout=10
         )
-        update_progress(job_id, f"Searching Pinterest for '{keyword}'...")
-        driver.get(search_url)
-        time.sleep(PAGE_LOAD_WAIT)
-        dismiss_all_popups(driver)
+        if resp.status_code == 200:
+            data = resp.json()
+            visits = data.get("EstimatedMonthlyVisits", {})
+            if visits:
+                # Get most recent month's visits
+                latest = list(visits.values())[-1] if visits else None
+                if latest:
+                    return int(latest)
 
-        # Collect pin URLs by scrolling
-        pins = []
-        attempts = 0
-        while len(pins) < max_pins and attempts < 8:
-            links = driver.find_elements(By.CSS_SELECTOR, "a[href*='/pin/']")
-            for lnk in links:
-                href = lnk.get_attribute("href")
-                if href and "/pin/" in href and href not in [p["url"] for p in pins]:
-                    pins.append({"url": href})
-                if len(pins) >= max_pins:
-                    break
-            if len(pins) < max_pins:
-                driver.execute_script("window.scrollBy(0, 1500);")
-                time.sleep(SCROLL_PAUSE)
-                dismiss_all_popups(driver)
-                attempts += 1
+        # Fallback — just return None (website exists but traffic unknown)
+        return None
 
-        pins = pins[:max_pins]
-        total = len(pins)
-        update_progress(job_id, f"Found {total} pins — now checking each profile...")
-
-        for i, pin in enumerate(pins):
-            update_progress(job_id, f"Checking pin {i+1}/{total}...")
-
-            try:
-                try:
-                    driver.get(pin["url"])
-                except (TimeoutException, WebDriverException):
-                    continue
-                time.sleep(3)
-                dismiss_all_popups(driver)
-
-                # Find profile link on pin page
-                profile_url = None
-                profile_name = None
-                for sel in [
-                    "a[data-test-id='creator-profile-link']",
-                    "[data-test-id='pin-closeup-user'] a",
-                    "a[data-test-id='user-rep-link']",
-                ]:
-                    try:
-                        el = driver.find_element(By.CSS_SELECTOR, sel)
-                        profile_url  = el.get_attribute("href")
-                        profile_name = el.text.strip()
-                        if profile_url:
-                            break
-                    except Exception:
-                        continue
-
-                # Fallback profile detection
-                if not profile_url:
-                    for lnk in driver.find_elements(By.CSS_SELECTOR, "a[href]"):
-                        href = lnk.get_attribute("href") or ""
-                        parts = href.rstrip("/").split("/")
-                        if (href.startswith("https://www.pinterest.com/") and
-                                "/pin/" not in href and len(parts) == 5):
-                            profile_url  = href
-                            profile_name = parts[-1]
-                            break
-
-                if not profile_url or profile_url in seen_profiles:
-                    continue
-
-                seen_profiles.add(profile_url)
-                clean_profile = profile_url.split("?")[0].rstrip("/")
-
-                # Visit profile page
-                try:
-                    driver.get(clean_profile)
-                except (TimeoutException, WebDriverException):
-                    continue
-                time.sleep(3)
-                dismiss_all_popups(driver)
-
-                # Get monthly views
-                view_text = None
-                for sel in [
-                    "[data-test-id='profile-monthly-views']",
-                    "[class*='monthlyViews']",
-                    "[class*='monthly']",
-                ]:
-                    try:
-                        el = driver.find_element(By.CSS_SELECTOR, sel)
-                        view_text = el.text.strip()
-                        if view_text:
-                            break
-                    except Exception:
-                        continue
-
-                if not view_text:
-                    try:
-                        body = driver.find_element(By.TAG_NAME, "body").text
-                        m = re.search(
-                            r"([\d,.]+\s*[KMBkmb]?)\s*(?:monthly\s*views|Monthly\s*Views)",
-                            body
-                        )
-                        if m:
-                            view_text = m.group(1).strip()
-                    except Exception:
-                        pass
-
-                view_int = parse_number(view_text)
-
-                if not profile_name:
-                    try:
-                        profile_name = driver.find_element(
-                            By.CSS_SELECTOR, "h1, [data-test-id='profile-name']"
-                        ).text.strip()
-                    except Exception:
-                        profile_name = clean_profile.rstrip("/").split("/")[-1]
-
-                update_progress(job_id,
-                    f"Pin {i+1}/{total} — {profile_name} — "
-                    f"views: {fmt(view_int)} (need {fmt(min_views_raw)})")
-
-                # FILTER 1: Pinterest views
-                if not view_int or view_int < min_views_raw:
-                    update_progress(job_id, f"Pin {i+1}/{total} — {profile_name} ✗ views too low")
-                    continue
-
-                # Get website
-                update_progress(job_id, f"Pin {i+1}/{total} — {profile_name} ✓ views — checking website...")
-                website_url = get_website_from_profile(driver, clean_profile)
-
-                if not website_url:
-                    update_progress(job_id, f"Pin {i+1}/{total} — {profile_name} ✗ no website")
-                    continue
-
-                # FILTER 2: Website traffic
-                update_progress(job_id, f"Pin {i+1}/{total} — {profile_name} — checking traffic for {website_url}...")
-                traffic = get_website_traffic(driver, website_url)
-
-                if traffic is not None and traffic < min_traffic:
-                    update_progress(job_id, f"Pin {i+1}/{total} — {profile_name} ✗ traffic too low ({fmt(traffic)})")
-                    continue
-
-                result = {
-                    "profile_name":        profile_name,
-                    "profile_url":         clean_profile,
-                    "pinterest_views":     fmt(view_int),
-                    "pinterest_views_int": view_int,
-                    "website_url":         website_url,
-                    "website_traffic":     fmt(traffic) if traffic else "Unknown",
-                    "website_traffic_int": traffic or 0,
-                }
-                results.append(result)
-                jobs[job_id]["results"] = list(results)
-
-                update_progress(job_id,
-                    f"✓ {profile_name} qualified! "
-                    f"({len(results)} profiles found so far)")
-
-            except Exception as e:
-                update_progress(job_id, f"Pin {i+1} error: {e}")
-                continue
-
-    except Exception as e:
-        update_progress(job_id, f"Search error: {e}")
-
-    return results
+    except Exception:
+        return None
 
 
 # ─────────────────────────────────────────────
@@ -497,29 +208,30 @@ def save_to_excel(results, keyword, job_id):
     ws = wb.active
     ws.title = "Pinterest Research"
 
-    RED="E60023"; WHITE="FFFFFF"; PINK="FFF0F0"; GRAY="F5F5F5"; BLUE="0563C1"
+    RED="E60023"; WHITE="FFFFFF"; PINK="FFF0F0"; BLUE="0563C1"
     hdr_font  = Font(name="Calibri", bold=True, color=WHITE, size=11)
     hdr_fill  = PatternFill(start_color=RED,  end_color=RED,  fill_type="solid")
-    main_fill = PatternFill(start_color=PINK, end_color=PINK, fill_type="solid")
+    row_fill  = PatternFill(start_color=PINK, end_color=PINK, fill_type="solid")
     center    = Alignment(horizontal="center", vertical="center", wrap_text=True)
     left      = Alignment(horizontal="left",   vertical="center", wrap_text=True)
     thin      = Side(style="thin", color="DDDDDD")
     border    = Border(left=thin, right=thin, top=thin, bottom=thin)
 
-    ws.merge_cells("A1:G1")
+    # Title row
+    ws.merge_cells("A1:F1")
     ws["A1"].value     = f"Pinterest Research · {keyword.title()} · {datetime.now().strftime('%Y-%m-%d %H:%M')}"
     ws["A1"].font      = Font(name="Calibri", bold=True, size=13, color=RED)
     ws["A1"].alignment = center
     ws.row_dimensions[1].height = 28
 
-    ws.merge_cells("A2:G2")
+    ws.merge_cells("A2:F2")
     ws["A2"].value     = f"Total qualifying profiles: {len(results)}"
     ws["A2"].font      = Font(name="Calibri", italic=True, size=10, color="666666")
     ws["A2"].alignment = center
     ws.row_dimensions[2].height = 18
 
-    headers    = ["Profile Name","Profile URL","Pinterest Views","Website URL","Website Traffic","Keyword"]
-    col_widths = [24, 42, 18, 42, 18, 24]
+    headers    = ["Profile Name", "Pinterest URL", "Monthly Views", "Website", "Traffic", "Keyword"]
+    col_widths = [24, 40, 18, 40, 16, 20]
     for col, (h, w) in enumerate(zip(headers, col_widths), 1):
         cell = ws.cell(row=3, column=col, value=h)
         cell.font=hdr_font; cell.fill=hdr_fill
@@ -529,15 +241,16 @@ def save_to_excel(results, keyword, job_id):
 
     for ri, r in enumerate(results, start=4):
         row_data = [
-            r["profile_name"], r["profile_url"], r["pinterest_views"],
-            r["website_url"], r["website_traffic"], keyword.title(),
+            r["profile_name"], r["profile_url"],
+            r["pinterest_views"], r["website_url"],
+            r["website_traffic"], keyword.title(),
         ]
         for col, val in enumerate(row_data, 1):
             cell = ws.cell(row=ri, column=col, value=val)
             cell.font=Font(name="Calibri", size=11)
-            cell.fill=main_fill; cell.border=border
-            cell.alignment=center if col in (3, 5) else left
-            if col in (2, 4) and val and str(val).startswith("http"):
+            cell.fill=row_fill; cell.border=border
+            cell.alignment=center if col in (3,5) else left
+            if col in (2,4) and val and str(val).startswith("http"):
                 cell.hyperlink = val
                 cell.font=Font(name="Calibri", size=11, color=BLUE, underline="single")
         ws.row_dimensions[ri].height = 18
@@ -551,49 +264,109 @@ def save_to_excel(results, keyword, job_id):
 
 
 # ─────────────────────────────────────────────
-#  BACKGROUND JOB WORKER
+#  MAIN SEARCH JOB
 # ─────────────────────────────────────────────
-def run_search_job(job_id, keyword, min_views_m, min_traffic, max_pins):
+def run_search_job(job_id, keyword, min_views, min_traffic, max_pins):
     jobs[job_id]["status"] = "running"
-    driver = None
+    results = []
+    seen_profiles = set()
+
     try:
-        update_progress(job_id, "Starting headless browser...")
-        driver = setup_driver()
+        session = get_session()
+        update_progress(job_id, f"Searching Pinterest for '{keyword}'...")
 
-        # Open Pinterest without login
-        open_pinterest_no_login(driver, job_id)
+        # Step 1: Get pins from search
+        pins = search_pins(session, keyword, max_pins)
+        total = len(pins)
+        update_progress(job_id, f"Found {total} pins — checking profiles...")
 
-        # Run the scrape
-        results = scrape_pins(driver, keyword, min_views_m, min_traffic, max_pins, job_id)
+        if total == 0:
+            update_progress(job_id, "No pins found. Try a different keyword or add Pinterest cookie.")
+            jobs[job_id]["status"] = "done"
+            return
 
-        # Deduplicate by website URL
-        seen, unique = set(), []
-        for r in results:
-            key = r.get("website_url","").lower().rstrip("/")
-            if key and key not in seen:
-                seen.add(key)
-                unique.append(r)
+        # Step 2: Check each profile
+        for i, pin in enumerate(pins):
+            username = pin.get("username","")
+            if not username or username in seen_profiles:
+                continue
+            seen_profiles.add(username)
 
-        unique.sort(key=lambda x: -x["pinterest_views_int"])
-        jobs[job_id]["results"] = unique
+            update_progress(job_id, f"Checking profile {i+1}/{total}: {username}...")
 
-        if unique:
-            path = save_to_excel(unique, keyword, job_id)
+            # Get full profile details
+            profile = get_profile_details(session, username)
+            if not profile:
+                profile = pin  # fallback to pin data
+
+            monthly_views = profile.get("monthly_views") or pin.get("monthly_views") or 0
+            if isinstance(monthly_views, str):
+                monthly_views = parse_number(monthly_views) or 0
+
+            update_progress(job_id,
+                f"Profile {i+1}/{total}: {username} — "
+                f"views: {fmt(monthly_views)} (need {fmt(min_views)})")
+
+            # FILTER 1: Pinterest views
+            if monthly_views < min_views:
+                continue
+
+            # Get website
+            website_url = (profile.get("website_url") or pin.get("website_url","")).strip()
+            if not website_url:
+                update_progress(job_id, f"{username} ✗ no website")
+                continue
+
+            # Clean website URL
+            if not website_url.startswith("http"):
+                website_url = "https://" + website_url
+
+            # FILTER 2: Traffic (optional — skip if min_traffic = 0)
+            traffic = None
+            if min_traffic > 0:
+                update_progress(job_id, f"{username} ✓ views — checking traffic...")
+                traffic = get_website_traffic_api(website_url)
+                if traffic is not None and traffic < min_traffic:
+                    update_progress(job_id, f"{username} ✗ traffic too low ({fmt(traffic)})")
+                    continue
+
+            profile_url = profile.get("profile_url") or f"https://www.pinterest.com/{username}/"
+            profile_name = profile.get("full_name") or profile.get("profile_name") or username
+
+            result = {
+                "profile_name":        profile_name,
+                "profile_url":         profile_url,
+                "pinterest_views":     fmt(monthly_views),
+                "pinterest_views_int": monthly_views,
+                "website_url":         website_url,
+                "website_traffic":     fmt(traffic) if traffic else "Unknown",
+                "website_traffic_int": traffic or 0,
+            }
+            results.append(result)
+            jobs[job_id]["results"] = list(results)
+            update_progress(job_id, f"✓ {profile_name} qualified! ({len(results)} found so far)")
+
+            time.sleep(0.3)  # small delay between requests
+
+        # Sort by views
+        results.sort(key=lambda x: -x["pinterest_views_int"])
+        jobs[job_id]["results"] = results
+
+        if results:
+            path = save_to_excel(results, keyword, job_id)
             jobs[job_id]["excel_path"] = path
-            update_progress(job_id, f"Done! {len(unique)} profiles found. Excel ready to download.")
+            update_progress(job_id, f"Done! {len(results)} profiles found. Excel ready.")
         else:
-            update_progress(job_id, "Done — no qualifying profiles found for this keyword.")
+            update_progress(job_id,
+                "Done — no qualifying profiles found. "
+                "Try lower min views or add Pinterest cookie for better results.")
 
         jobs[job_id]["status"] = "done"
 
     except Exception as e:
-        jobs[job_id]["status"]   = "error"
-        jobs[job_id]["error"]    = str(e)
+        jobs[job_id]["status"] = "error"
+        jobs[job_id]["error"]  = str(e)
         update_progress(job_id, f"Error: {e}")
-    finally:
-        if driver:
-            try: driver.quit()
-            except Exception: pass
 
 
 # ─────────────────────────────────────────────
@@ -601,27 +374,23 @@ def run_search_job(job_id, keyword, min_views_m, min_traffic, max_pins):
 # ─────────────────────────────────────────────
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "message": "PinSearchPro API running"})
+    has_cookie = bool(PINTEREST_COOKIE)
+    return jsonify({
+        "status": "ok",
+        "message": "PinSearchPro API running (no-browser mode)",
+        "pinterest_cookie_set": has_cookie,
+    })
 
 
 @app.route("/search", methods=["POST"])
 def start_search():
-    """
-    POST /search
-    {
-      "keyword":     "home decor",
-      "min_views":   2000000,
-      "min_traffic": 200,
-      "max_pins":    20
-    }
-    """
     data = request.get_json()
     if not data or not data.get("keyword"):
         return jsonify({"error": "keyword is required"}), 400
 
     keyword     = data["keyword"].strip().lower()
-    min_views_m = float(data.get("min_views", 2_000_000)) / 1_000_000
-    min_traffic = int(data.get("min_traffic", 200))
+    min_views   = int(data.get("min_views", 2_000_000))
+    min_traffic = int(data.get("min_traffic", 0))  # 0 = skip traffic check
     max_pins    = max(20, min(int(data.get("max_pins", 20)), 200))
 
     job_id = str(uuid.uuid4())
@@ -637,7 +406,7 @@ def start_search():
 
     threading.Thread(
         target=run_search_job,
-        args=(job_id, keyword, min_views_m, min_traffic, max_pins),
+        args=(job_id, keyword, min_views, min_traffic, max_pins),
         daemon=True
     ).start()
 
@@ -666,7 +435,7 @@ def download_excel(job_id):
     if not job:
         return jsonify({"error": "Job not found"}), 404
     if not job.get("excel_path") or not os.path.exists(job["excel_path"]):
-        return jsonify({"error": "Excel not ready yet"}), 404
+        return jsonify({"error": "Excel not ready"}), 404
     return send_file(
         job["excel_path"],
         as_attachment=True,
